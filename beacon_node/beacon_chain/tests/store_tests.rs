@@ -6,7 +6,6 @@ use beacon_chain::schema_change::migrate_schema;
 use beacon_chain::test_utils::{
     test_spec, AttestationStrategy, BeaconChainHarness, BlockStrategy, DiskHarnessType,
 };
-use beacon_chain::validator_monitor::DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD;
 use beacon_chain::{
     historical_blocks::HistoricalBlockError, migrate::MigratorConfig, BeaconChain,
     BeaconChainError, BeaconChainTypes, BeaconSnapshot, BlockError, ChainConfig,
@@ -2141,6 +2140,7 @@ async fn weak_subjectivity_sync_test(slots: Vec<Slot>, checkpoint_slot: Slot) {
         Duration::from_secs(seconds_per_slot),
     );
     slot_clock.set_slot(harness.get_current_slot().as_u64());
+
     let beacon_chain = Arc::new(
         BeaconChainBuilder::new(MinimalEthSpec)
             .store(store.clone())
@@ -2159,7 +2159,6 @@ async fn weak_subjectivity_sync_test(slots: Vec<Slot>, checkpoint_slot: Slot) {
                 log.clone(),
                 1,
             )))
-            .monitor_validators(true, vec![], DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD, log)
             .build()
             .expect("should build"),
     );

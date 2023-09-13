@@ -4,7 +4,7 @@ pub use crate::{
     beacon_chain::{BEACON_CHAIN_DB_KEY, ETH1_CACHE_DB_KEY, FORK_CHOICE_DB_KEY, OP_POOL_DB_KEY},
     migrate::MigratorConfig,
     sync_committee_verification::Error as SyncCommitteeError,
-    validator_monitor::DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD,
+    validator_monitor::{ValidatorMonitor, ValidatorMonitorConfig},
     BeaconChainError, NotifyExecutionLayer, ProduceBlockVerification,
 };
 use crate::{
@@ -169,6 +169,7 @@ pub struct Builder<T: BeaconChainTypes> {
     mock_execution_layer: Option<MockExecutionLayer<T::EthSpec>>,
     mock_builder: Option<TestingBuilder<T::EthSpec>>,
     testing_slot_clock: Option<TestingSlotClock>,
+    validator_monitor_config: Option<ValidatorMonitorConfig>,
     runtime: TestRuntime,
     log: Logger,
 }
@@ -303,6 +304,7 @@ where
             mock_execution_layer: None,
             mock_builder: None,
             testing_slot_clock: None,
+            validator_monitor_config: None,
             runtime,
             log,
         }
@@ -372,6 +374,14 @@ where
     pub fn store_mutator(mut self, mutator: BoxedMutator<E, Hot, Cold>) -> Self {
         assert!(self.store_mutator.is_none(), "store mutator already set");
         self.store_mutator = Some(mutator);
+        self
+    }
+
+    pub fn validator_monitor_config(
+        mut self,
+        validator_monitor_config: ValidatorMonitorConfig,
+    ) -> Self {
+        self.validator_monitor_config = Some(validator_monitor_config);
         self
     }
 
@@ -516,8 +526,10 @@ where
         let validator_keypairs = self
             .validator_keypairs
             .expect("cannot build without validator keypairs");
-        let chain_config = self.chain_config.unwrap_or_default();
 
+        let validator_monitor_config = self.validator_monitor_config.unwrap_or_default();
+
+        let chain_config = self.chain_config.unwrap_or_default();
         let mut builder = BeaconChainBuilder::new(self.eth_spec_instance)
             .logger(log.clone())
             .custom_spec(spec)
@@ -537,7 +549,7 @@ where
                 log.clone(),
                 5,
             )))
-            .monitor_validators(true, vec![], DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD, log);
+            .validator_monitor_config(validator_monitor_config);
 
         builder = if let Some(mutator) = self.initial_mutator {
             mutator(builder)
