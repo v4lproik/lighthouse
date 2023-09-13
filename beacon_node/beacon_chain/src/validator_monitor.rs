@@ -2,10 +2,14 @@
 //!
 //! This component should not affect consensus.
 
+use crate::beacon_proposer_cache::{BeaconProposerCache, TYPICAL_SLOTS_PER_EPOCH};
 use crate::metrics;
-use parking_lot::RwLock;
-use slog::{crit, debug, info, Logger};
+use itertools::Itertools;
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
+use slog::{crit, debug, error, info, warn, Logger};
 use slot_clock::SlotClock;
+use smallvec::SmallVec;
 use state_processing::per_epoch_processing::{
     errors::EpochProcessingError, EpochProcessingSummary,
 };
@@ -14,6 +18,7 @@ use std::convert::TryFrom;
 use std::io;
 use std::marker::PhantomData;
 use std::str::Utf8Error;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use store::AbstractExecPayload;
 use types::{
@@ -35,7 +40,28 @@ pub const HISTORIC_EPOCHS: usize = 10;
 /// Once the validator monitor reaches this number of validators it will stop
 /// tracking their metrics/logging individually in an effort to reduce
 /// Prometheus cardinality and log volume.
-pub const DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD: usize = 64;
+const DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD: usize = 64;
+
+/// Lag slots used in detecting missed blocks for the monitored validators
+pub const MISSED_BLOCK_LAG_SLOTS: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+// Initial configuration values for the `ValidatorMonitor`.
+pub struct ValidatorMonitorConfig {
+    pub auto_register: bool,
+    pub validators: Vec<PublicKeyBytes>,
+    pub individual_tracking_threshold: usize,
+}
+
+impl Default for ValidatorMonitorConfig {
+    fn default() -> Self {
+        Self {
+            auto_register: false,
+            validators: vec![],
+            individual_tracking_threshold: DEFAULT_INDIVIDUAL_TRACKING_THRESHOLD,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -343,26 +369,40 @@ pub struct ValidatorMonitor<T> {
     /// large validator counts causing infeasibly high cardinailty for
     /// Prometheus and high log volumes.
     individual_tracking_threshold: usize,
+    /// An Option representing the validator index of a monitored validator who may have missed a (non-finalized) block at current_epoch - MISSED_BLOCK_LAG_SLOTS
+    last_epoch_missed_block_validator: Option<u64>,
+    /// A Map representing the (non-finalized) missed blocks by epoch, validator_index(state.validators) and slot
+    missed_blocks: HashSet<(Epoch, u64, Slot)>,
+    // A beacon proposer cache
+    beacon_proposer_cache: Arc<Mutex<BeaconProposerCache>>,
     log: Logger,
     _phantom: PhantomData<T>,
 }
 
 impl<T: EthSpec> ValidatorMonitor<T> {
     pub fn new(
-        pubkeys: Vec<PublicKeyBytes>,
-        auto_register: bool,
-        individual_tracking_threshold: usize,
+        config: ValidatorMonitorConfig,
+        beacon_proposer_cache: Arc<Mutex<BeaconProposerCache>>,
         log: Logger,
     ) -> Self {
+        let ValidatorMonitorConfig {
+            auto_register,
+            validators,
+            individual_tracking_threshold,
+        } = config;
+
         let mut s = Self {
             validators: <_>::default(),
             indices: <_>::default(),
             auto_register,
             individual_tracking_threshold,
+            last_epoch_missed_block_validator: <_>::default(),
+            missed_blocks: <_>::default(),
+            beacon_proposer_cache,
             log,
             _phantom: PhantomData,
         };
-        for pubkey in pubkeys {
+        for pubkey in validators {
             s.add_validator_pubkey(pubkey)
         }
         s
@@ -410,6 +450,9 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                 }
                 self.indices.insert(i, validator.pubkey);
             });
+
+        // Add missed non-finalized blocks for the monitored validators
+        self.add_validators_missed_blocks(state);
 
         // Update metrics for individual validators.
         for monitored_validator in self.validators.values() {
@@ -489,6 +532,131 @@ impl<T: EthSpec> ValidatorMonitor<T> {
                 }
             }
         }
+
+        // Add missed non-finalized blocks for the monitored validators
+        // count the amount of times a monitored validator missed a non-finalized block
+        self.missed_blocks
+            .iter()
+            .group_by(|(_, validator_index, _)| *validator_index)
+            .into_iter()
+            .for_each(|(validator_index, group)| {
+                let missed_blocks_count = group.count();
+                self.aggregatable_metric(validator_index.to_string().as_str(), |label| {
+                    metrics::set_int_gauge(
+                        &metrics::VALIDATOR_MONITOR_MISSED_NON_FINALIZED_BLOCKS_TOTAL,
+                        &[label],
+                        u64_to_i64(missed_blocks_count as u64),
+                    );
+                });
+            });
+
+        // add to the total missed blocks by monitored validator
+        if let Some(i) = self.last_epoch_missed_block_validator {
+            self.aggregatable_metric(i.to_string().as_str(), |label| {
+                metrics::inc_counter_vec(&metrics::VALIDATOR_MONITOR_MISSED_BLOCKS_TOTAL, &[label]);
+            });
+            self.last_epoch_missed_block_validator = None;
+        };
+    }
+
+    /// Add missed non-finalized blocks for the monitored validators
+    fn add_validators_missed_blocks(&mut self, state: &BeaconState<T>) {
+        // Define range variables
+        let current_slot = state.slot();
+        let start_slot = current_slot.saturating_sub(T::slots_per_epoch()).as_u64();
+        let end_slot = current_slot.saturating_sub(MISSED_BLOCK_LAG_SLOTS).as_u64();
+
+        // As we are skipping the genesis slot, we can simply pass Hash256::zero() as the shuffling decision block
+        // cf. state.proposer_shuffling_decision_root_at_epoch implementation
+        let shuffling_decision_block = Hash256::zero();
+
+        // List of proposers per epoch from the beacon_proposer_cache
+        let mut proposers_per_epoch: Option<SmallVec<[usize; TYPICAL_SLOTS_PER_EPOCH]>> = None;
+
+        for (prev_slot, slot) in (start_slot..=end_slot).map(Slot::new).tuple_windows() {
+            // Condition for missed_block is defined such as block_root(slot) == block_root(slot - 1)
+            // where the proposer who missed the block is the proposer of the block at block_root(slot)
+            if let (Ok(block_root), Ok(prev_block_root)) =
+                (state.get_block_root(slot), state.get_block_root(prev_slot))
+            {
+                // Found missed block
+                if block_root == prev_block_root {
+                    let slot_epoch = slot.epoch(T::slots_per_epoch());
+                    let prev_slot_epoch = prev_slot.epoch(T::slots_per_epoch());
+
+                    if let Ok(shuffling_decision_block) = state
+                        .proposer_shuffling_decision_root_at_epoch(
+                            slot_epoch,
+                            shuffling_decision_block,
+                        )
+                    {
+                        // Only update the cache if it needs to be initialised or because
+                        // slot is at epoch + 1
+                        if proposers_per_epoch.is_none() || slot_epoch != prev_slot_epoch {
+                            proposers_per_epoch = self.get_proposers_by_epoch_from_cache(
+                                slot_epoch,
+                                shuffling_decision_block,
+                            );
+                        }
+
+                        // Only add missed blocks for the proposer if it's in the list of monitored validators
+                        let slot_in_epoch = slot % T::slots_per_epoch();
+                        if let Some(proposer_index) = proposers_per_epoch
+                            .as_deref()
+                            .and_then(|proposers| proposers.get(slot_in_epoch.as_usize()))
+                        {
+                            let i = *proposer_index as u64;
+                            if let Some(pub_key) = self.indices.get(&i) {
+                                if self.validators.get(pub_key).is_some() {
+                                    // Add to missed blocks
+                                    self.missed_blocks.insert((slot_epoch, i, slot));
+                                    // Add to validator that missed the block for the current epoch
+                                    if slot == end_slot {
+                                        self.last_epoch_missed_block_validator = Some(i);
+                                        error!(
+                                            self.log,
+                                            "Validator missed a block";
+                                            "index" => i,
+                                            "slot" => slot,
+                                            "parent block root" => ?prev_block_root,
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        self.log,
+                                        "Missing validator index";
+                                        "info" => "potentially inconsistency in the validator manager",
+                                        "index" => i,
+                                    )
+                                }
+                            }
+                        } else {
+                            debug!(
+                                self.log,
+                                "Could not get proposers for from cache";
+                                "epoch" => ?slot_epoch
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prune missed blocks that are prior to last finalized epoch
+        let finalized_epoch = state.finalized_checkpoint().epoch;
+        self.missed_blocks
+            .retain(|(epoch, _, _)| *epoch >= finalized_epoch);
+    }
+
+    fn get_proposers_by_epoch_from_cache(
+        &mut self,
+        epoch: Epoch,
+        shuffling_decision_block: Hash256,
+    ) -> Option<SmallVec<[usize; TYPICAL_SLOTS_PER_EPOCH]>> {
+        let mut cache = self.beacon_proposer_cache.lock();
+        cache
+            .get_epoch::<T>(shuffling_decision_block, epoch)
+            .cloned()
     }
 
     /// Run `func` with the `TOTAL_LABEL` and optionally the
@@ -820,6 +988,17 @@ impl<T: EthSpec> ValidatorMonitor<T> {
         } else {
             None
         }
+    }
+
+    pub fn get_monitored_validator_missed_block_count(&self, validator_index: u64) -> u64 {
+        self.missed_blocks
+            .iter()
+            .filter(|(_, index, _)| *index == validator_index)
+            .count() as u64
+    }
+
+    pub fn get_beacon_proposer_cache(&self) -> Arc<Mutex<BeaconProposerCache>> {
+        self.beacon_proposer_cache.clone()
     }
 
     /// If `self.auto_register == true`, add the `validator_index` to `self.monitored_validators`.
